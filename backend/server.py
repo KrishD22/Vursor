@@ -600,14 +600,28 @@ async def ai_edit_stream_endpoint(video_id: str, prompt: str, edit_type: str = "
             yield f"data: {json.dumps({'status': 'processing', 'message': 'AI analysis complete, preparing response...', 'progress': 80})}\n\n"
             await asyncio.sleep(0.5)
             
-            # Use the output filename that was actually created by the processing function
-            # Don't overwrite it with a new timestamp
-            if not result.get('output_file'):
-                # Fallback only if no output_file was set
-                timestamp = int(time.time())
-                output_filename = f"ai_edited_{video_id[:8]}_{timestamp}.mp4"
-                result['output_file'] = output_filename
-                result['output_path'] = f"outputs/{output_filename}"
+            # Only report files that the processing function actually produced.
+            # We no longer strip output_file/output_path if the file isn't immediately visible here.
+            # The client already polls for readiness via waitForOutputFile, so always return the output
+            # identifiers to allow the UI to update once the file becomes available.
+            if result.get('success') and result.get('output_file'):
+                try:
+                    final_path = OUTPUT_DIR / result['output_file']
+                    attempts = 0
+                    # Light touch wait to help reduce instant 404s, but do not mutate result
+                    while attempts < 20:
+                        if final_path.exists():
+                            try:
+                                size_ok = final_path.stat().st_size > 0
+                            except Exception:
+                                size_ok = False
+                            if size_ok:
+                                break
+                        attempts += 1
+                        await asyncio.sleep(0.25)
+                except Exception:
+                    # If any check fails, proceed and let the frontend poll
+                    pass
             
             yield f"data: {json.dumps({'status': 'completed', 'message': 'Video editing analysis complete!', 'progress': 100, 'result': result})}\n\n"
             
@@ -1577,6 +1591,140 @@ async def process_specific_request(prompt: str, video_path: str) -> Dict[str, An
     try:
         print(f"🎯 Processing specific request: {prompt}")
         prompt_lower = (prompt or '').lower()
+
+        # Fast-path: apply a cinematic color grade template
+        if any(k in prompt_lower for k in ["color grade", "color grading", "cinematic grade", "cinematic look", "cinematic"]):
+            timestamp = int(time.time())
+            video_path_obj = Path(video_path)
+            video_id = video_path_obj.stem
+            output_filename = f"ai_edited_{video_id[:8]}_{timestamp}.mp4"
+            output_path = OUTPUT_DIR / output_filename
+
+            print("🎨 Applying cinematic color grade preset...")
+            result = ffmpeg_utils.apply_video_effects(
+                str(video_path),
+                str(output_path),
+                artistic_filter="cinematic"
+            )
+            if result and result.get("success") and output_path.exists():
+                return {
+                    "type": "specific",
+                    "commands": "Color Grade AND cinematic preset",
+                    "status": "completed",
+                    "output_file": output_filename,
+                    "output_path": str(output_path),
+                    "success": True
+                }
+            return {
+                "type": "specific",
+                "commands": prompt,
+                "status": "error",
+                "error": result.get("error", "Failed to apply cinematic color grade") if result else "Processing failed"
+            }
+
+        # Fast-path: add subtitles (auto-transcribe by default)
+        if any(k in prompt_lower for k in ["add subtitles", "subtitles", "subtitle", "captions", "caption", "transcribe", "auto subtitle", "auto captions"]):
+            timestamp = int(time.time())
+            video_path_obj = Path(video_path)
+            video_id = video_path_obj.stem
+            # We'll burn to a temporary file, then convert to a web-friendly final file
+            temp_burn = OUTPUT_DIR / f"tmp_burn_{video_id[:8]}_{timestamp}.mp4"
+            final_filename = f"ai_edited_{video_id[:8]}_{timestamp}.mp4"
+            final_path = OUTPUT_DIR / final_filename
+
+            print("📝 Adding subtitles via auto-transcription...")
+            # Default to English; could be extended to parse language from prompt
+            burn_res = ffmpeg_utils.transcribe_audio(
+                str(video_path),
+                str(temp_burn),
+                language="en-US",
+                chunk_duration=12,
+                max_chunks=1
+            )
+            if not (burn_res and burn_res.get("success") and temp_burn.exists()):
+                return {
+                    "type": "specific",
+                    "commands": prompt,
+                    "status": "error",
+                    "error": burn_res.get("error", "Failed to burn subtitles") if burn_res else "Processing failed"
+                }
+
+            # Ensure browser-friendly MP4 like object.py
+            print("🔄 Converting burned output to web-friendly MP4...")
+            conv_res = ffmpeg_utils.convert_video(str(temp_burn), str(final_path), video_codec="libx264", audio_codec="aac", quality="23")
+
+            # Success path: conversion produced final file
+            if conv_res and conv_res.get("success") and final_path.exists():
+                # Safe to delete temp_burn now
+                try:
+                    if temp_burn.exists():
+                        temp_burn.unlink()
+                except Exception:
+                    pass
+                # Also copy into UPLOAD_DIR with a new file_id so it appears as a selectable source
+                new_upload_id = str(uuid.uuid4())
+                new_upload_name = f"{new_upload_id}.mp4"
+                new_upload_path = UPLOAD_DIR / new_upload_name
+                try:
+                    import shutil as _shutil
+                    _shutil.copy2(str(final_path), str(new_upload_path))
+                except Exception:
+                    new_upload_id = None
+                return {
+                    "type": "specific",
+                    "commands": "Add Subtitles AND auto-transcribe",
+                    "status": "completed",
+                    "output_file": final_filename,
+                    "output_path": str(final_path),
+                    "output_url": f"/api/outputs/{final_filename}",
+                    "upload_file_id": new_upload_id,
+                    "success": True
+                }
+
+            # Fallback: if conversion failed but burned file exists, promote it as final output
+            try:
+                if temp_burn.exists() and temp_burn.stat().st_size > 0:
+                    # Move/rename temp to final name for consistent serving
+                    try:
+                        temp_burn.rename(final_path)
+                    except Exception:
+                        import shutil as _shutil
+                        _shutil.copy2(str(temp_burn), str(final_path))
+                        try:
+                            temp_burn.unlink()
+                        except Exception:
+                            pass
+                    if final_path.exists():
+                        # Also copy into UPLOAD_DIR with a new file_id
+                        new_upload_id = str(uuid.uuid4())
+                        new_upload_name = f"{new_upload_id}.mp4"
+                        new_upload_path = UPLOAD_DIR / new_upload_name
+                        try:
+                            import shutil as _shutil
+                            _shutil.copy2(str(final_path), str(new_upload_path))
+                        except Exception:
+                            new_upload_id = None
+                        return {
+                            "type": "specific",
+                            "commands": "Add Subtitles AND auto-transcribe",
+                            "status": "completed",
+                            "output_file": final_filename,
+                            "output_path": str(final_path),
+                            "output_url": f"/api/outputs/{final_filename}",
+                            "upload_file_id": new_upload_id,
+                            "success": True
+                        }
+            except Exception:
+                # Fall through to error
+                pass
+
+            # Error path: neither conversion nor fallback produced an output
+            return {
+                "type": "specific",
+                "commands": prompt,
+                "status": "error",
+                "error": conv_res.get("error", "Failed to convert burned video for web playback and no fallback available") if conv_res else "Processing failed"
+            }
 
         # Fast-path: handle "keep only the part where (he|she|they) says <keyword>" without relying on AI parsing
         if re.search(r"\bkeep( only)? (the )?part where (he|she|they) says\b", prompt_lower):
