@@ -1070,6 +1070,206 @@ class FFmpegUtils:
         except Exception as e:
             return {"success": False, "error": f"Splice error: {str(e)}"}
 
+    def generate_static_tv_transition(self, output_path, duration_seconds=0.7, width=1280, height=720, fps=30, sample_rate=48000, volume=0.8):
+        """
+        Generate a short static TV transition clip with noisy video and white-noise audio.
+        Encoded as H.264/AAC, yuv420p for web compatibility.
+        """
+        try:
+            duration_seconds = float(duration_seconds)
+            if duration_seconds <= 0:
+                duration_seconds = 0.5
+        except Exception:
+            duration_seconds = 0.7
+
+        # Ensure even dimensions for yuv420p
+        width = int(width // 2 * 2)
+        height = int(height // 2 * 2)
+        fps = int(max(1, fps))
+        sample_rate = int(max(8000, sample_rate))
+        volume = float(max(0.0, min(2.0, volume)))
+
+        # Video source: black base with animated noise to approximate TV static
+        vsrc = f"color=c=black:s={width}x{height},noise=alls=80:allf=t+u,fps={fps},format=yuv420p"
+        # Audio source: white noise
+        asrc = f"anoisesrc=color=white:amplitude={volume}:sample_rate={sample_rate}"
+
+        command = [
+            self.ffmpeg_path,
+            '-f', 'lavfi', '-i', vsrc,
+            '-f', 'lavfi', '-i', asrc,
+            '-t', f"{duration_seconds:.3f}",
+            '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '22', '-preset', 'fast',
+            '-c:a', 'aac', '-b:a', '192k',
+            '-shortest',
+            '-movflags', '+faststart',
+            '-y', output_path
+        ]
+
+        return self._run_command(command, "Generate Static TV Transition")
+
+    def insert_transition(self, input_path, output_path, insert_time, transition_path=None, transition_duration_seconds=0.7):
+        """
+        Insert a transition clip (with its own audio) at a specified time.
+        The input is split at insert_time and the transition is inserted between the parts.
+
+        Args:
+            input_path (str): Source video
+            output_path (str): Destination video
+            insert_time (float|str): Seconds or HH:MM:SS(.ms)
+            transition_path (str|None): Optional existing transition clip; if None, generate static TV transition
+            transition_duration_seconds (float): Duration if generating transition
+        """
+        if not os.path.exists(input_path):
+            return {"success": False, "error": f"Input file not found: {input_path}"}
+
+        def parse_time_to_seconds(t):
+            if isinstance(t, (int, float)):
+                return float(t)
+            try:
+                t = str(t).strip()
+                if ':' in t:
+                    parts = t.split(':')
+                    parts = [float(p) for p in parts]
+                    if len(parts) == 3:
+                        return parts[0]*3600 + parts[1]*60 + parts[2]
+                    if len(parts) == 2:
+                        return parts[0]*60 + parts[1]
+                if t.endswith('s'):
+                    return float(t[:-1])
+                return float(t)
+            except Exception:
+                return 0.0
+
+        def seconds_to_time_str(sec):
+            sec = max(0.0, float(sec))
+            hours = int(sec // 3600)
+            minutes = int((sec % 3600) // 60)
+            seconds = sec % 60
+            return f"{hours:02d}:{minutes:02d}:{seconds:06.3f}"
+
+        try:
+            # Inspect input media for dimensions/fps/audio
+            info_result = self.get_media_info(input_path)
+            if not info_result.get('success'):
+                return {"success": False, "error": "Could not read input media info"}
+            width = 1280; height = 720; fps = 30; sample_rate = 48000
+            for s in info_result.get('info', {}).get('streams', []) or []:
+                if s.get('codec_type') == 'video':
+                    width = int(s.get('width') or width)
+                    height = int(s.get('height') or height)
+                    # Parse r_frame_rate like '30000/1001'
+                    r = s.get('r_frame_rate') or s.get('avg_frame_rate')
+                    try:
+                        if r and '/' in r:
+                            num, den = r.split('/')
+                            den = float(den) if float(den) != 0 else 1.0
+                            fps = max(1, int(round(float(num) / float(den))))
+                        elif r:
+                            fps = max(1, int(round(float(r))))
+                    except Exception:
+                        pass
+                elif s.get('codec_type') == 'audio':
+                    try:
+                        sample_rate = int(s.get('sample_rate') or sample_rate)
+                    except Exception:
+                        pass
+
+            insert_seconds = parse_time_to_seconds(insert_time)
+            # Clamp insert time to [0, duration]
+            try:
+                total = float(info_result['info']['format']['duration'])
+                if insert_seconds < 0:
+                    insert_seconds = 0.0
+                if insert_seconds > total:
+                    insert_seconds = total
+            except Exception:
+                total = None
+
+            # Prepare temp files
+            base = os.path.splitext(os.path.basename(input_path))[0]
+            temp_part1 = f"temp_{base}_part1.mp4"
+            temp_part2 = f"temp_{base}_part2.mp4"
+            temp_trans = transition_path or f"temp_{base}_transition.mp4"
+            concat_list = "temp_insert_concat.txt"
+
+            created_part1 = False
+            created_part2 = False
+            created_trans = False
+            try:
+                # Part 1 (0 -> insert_time)
+                if insert_seconds > 0.01:
+                    cmd1 = [
+                        self.ffmpeg_path, '-i', input_path,
+                        '-t', seconds_to_time_str(insert_seconds),
+                        '-vf', f'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+                        '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+                        '-c:a', 'aac', '-crf', '23', '-preset', 'fast',
+                        '-avoid_negative_ts', 'make_zero',
+                        '-y', temp_part1
+                    ]
+                    res1 = self._run_command(cmd1, "Extract Part 1 for Transition")
+                    if not res1.get('success'):
+                        return res1
+                    created_part1 = True
+
+                # Part 2 (insert_time -> end)
+                if total is None or insert_seconds < (total - 0.01):
+                    cmd2 = [
+                        self.ffmpeg_path, '-ss', seconds_to_time_str(insert_seconds), '-i', input_path,
+                        '-vf', f'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+                        '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+                        '-c:a', 'aac', '-crf', '23', '-preset', 'fast',
+                        '-avoid_negative_ts', 'make_zero',
+                        '-y', temp_part2
+                    ]
+                    res2 = self._run_command(cmd2, "Extract Part 2 for Transition")
+                    if not res2.get('success'):
+                        return res2
+                    created_part2 = True
+
+                # Transition clip
+                if not transition_path:
+                    gen = self.generate_static_tv_transition(temp_trans, duration_seconds=transition_duration_seconds, width=width, height=height, fps=fps, sample_rate=sample_rate, volume=0.7)
+                    if not gen.get('success'):
+                        return gen
+                    created_trans = True
+
+                # Build concat list
+                parts = []
+                if created_part1:
+                    parts.append(temp_part1)
+                parts.append(temp_trans)
+                if created_part2:
+                    parts.append(temp_part2)
+                if len(parts) == 0:
+                    return {"success": False, "error": "No parts to concatenate"}
+                with open(concat_list, 'w') as f:
+                    for p in parts:
+                        f.write(f"file '{os.path.abspath(p)}'\n")
+
+                # Concat with re-encode to ensure compatibility
+                cmd_concat = [
+                    self.ffmpeg_path, '-f', 'concat', '-safe', '0',
+                    '-i', concat_list,
+                    '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+                    '-c:a', 'aac', '-crf', '23', '-preset', 'fast',
+                    '-movflags', '+faststart',
+                    '-y', output_path
+                ]
+                res_concat = self._run_command(cmd_concat, "Insert Transition Concat")
+                return res_concat
+            finally:
+                # Cleanup
+                for tmp in [concat_list, temp_part1 if created_part1 else None, temp_part2 if created_part2 else None, temp_trans if (created_trans and (not transition_path)) else None]:
+                    try:
+                        if tmp and os.path.exists(tmp):
+                            os.remove(tmp)
+                    except Exception:
+                        pass
+        except Exception as e:
+            return {"success": False, "error": f"Insert transition error: {str(e)}"}
+
 
 # Convenience functions for quick usage
 def trim_video(input_path, output_path, start_time, duration, precise=False, ultra_precise=False, ffmpeg_path="ffmpeg"):

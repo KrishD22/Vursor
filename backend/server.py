@@ -1365,6 +1365,52 @@ def _find_keyword_segments_in_audio(video_path: str, keyword: str, language: str
     except Exception:
         return []
 
+def _find_first_pause(video_path: str, min_silence_ms: int = 600, silence_threshold_db: Optional[float] = None) -> Optional[tuple[float, float]]:
+    """Detect the first pause (silence) in the video's audio and return (start,end) seconds.
+    Uses pydub's detect_silence with an adaptive threshold based on audio dBFS.
+    """
+    try:
+        # Extract mono wav at 16kHz
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_audio:
+            temp_audio_path = temp_audio.name
+        extract_cmd = [ffmpeg_utils.ffmpeg_path, '-i', video_path, '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', '-y', temp_audio_path]
+        _ = ffmpeg_utils._run_command(extract_cmd, "Audio Extraction for Pause Detection")
+        if not os.path.exists(temp_audio_path):
+            return None
+        from pydub.silence import detect_silence  # imported here to avoid global dependency when unused
+        audio = AudioSegment.from_wav(temp_audio_path)
+        try:
+            base_dbfs = audio.dBFS
+        except Exception:
+            base_dbfs = -35.0
+        if base_dbfs == float('-inf'):
+            base_dbfs = -50.0
+        thresh = float(silence_threshold_db) if silence_threshold_db is not None else base_dbfs - 16.0
+        # Clamp threshold
+        if thresh > -10.0:
+            thresh = -10.0
+        if thresh < -80.0:
+            thresh = -80.0
+        silences = detect_silence(audio, min_silence_len=int(min_silence_ms), silence_thresh=thresh, seek_step=10)
+        if not silences:
+            os.remove(temp_audio_path)
+            return None
+        # pick the first non-zero start if available
+        start_ms, end_ms = silences[0]
+        for s_ms, e_ms in silences:
+            if s_ms > 0:
+                start_ms, end_ms = s_ms, e_ms
+                break
+        os.remove(temp_audio_path)
+        return (start_ms / 1000.0, end_ms / 1000.0)
+    except Exception:
+        try:
+            if 'temp_audio_path' in locals() and os.path.exists(temp_audio_path):
+                os.remove(temp_audio_path)
+        except Exception:
+            pass
+        return None
+
 async def process_vague_request(prompt: str, video_path: str) -> Dict[str, Any]:
     """Process vague editing request using AI and execute the editing"""
     print(f"🎬 Processing vague request: {prompt}")
@@ -1450,6 +1496,14 @@ async def process_vague_request(prompt: str, video_path: str) -> Dict[str, Any]:
                 result = {"success": True, "message": "Face blur applied successfully"}
             else:
                 result = {"success": False, "error": face_blur_result.get("message", "Face blur failed")}
+        elif "transition" in prompt_lower:
+            print("🔁 Transition requested in vague mode - skipping (transitions require specific mode).")
+            return {
+                "type": "vague",
+                "commands": commands,
+                "status": "error",
+                "error": "Transitions are only supported in specific mode. Please re-run with edit_type='specific' and include 'at <time>' if needed."
+            }
         elif "bright" in prompt_lower:
             print("☀️ Applying brightness effect...")
             result = ffmpeg_utils.apply_video_effects(
@@ -1917,6 +1971,79 @@ async def process_specific_request(prompt: str, video_path: str) -> Dict[str, An
         
         print(f"📝 Parsed instances: {instances}")
         
+        # Direct transition handling: insert static TV transition where requested
+        trans_cmd_idx = None
+        trans_location = ""
+        for idx, (cmd, loc) in enumerate(instances):
+            if any(t in cmd.lower() for t in ["transition", "add transition", "insert transition", "tv transition", "static transition"]):
+                trans_cmd_idx = idx
+                trans_location = loc or ""
+                break
+        if trans_cmd_idx is not None or "transition" in prompt_lower:
+            try:
+                timestamp = int(time.time())
+                video_path_obj = Path(video_path)
+                video_id = video_path_obj.stem
+                output_filename = f"ai_edited_{video_id[:8]}_{timestamp}.mp4"
+                output_path = OUTPUT_DIR / output_filename
+
+                dur = _get_video_duration_seconds(video_path)
+                text_for_time = f"{trans_location} {prompt}".lower()
+                insert_point = None
+                # 1) After he says/after she says/after they say <keyword>
+                kw_match = re.search(r"after\s+(?:he|she|they)\s+(?:say|says|said|mention|mentions|mentioned)\s+['\"]([^'\"]+)['\"]|after\s+(?:he|she|they)\s+(?:say|says|said|mention|mentions|mentioned)\s+([a-z0-9\-]+)", text_for_time, re.IGNORECASE)
+                if kw_match and insert_point is None:
+                    keyword = (kw_match.group(1) or kw_match.group(2) or '').strip()
+                    if keyword:
+                        segs = _find_keyword_segments_in_audio(video_path, keyword)
+                        if segs:
+                            # place just after the first match
+                            insert_point = max(0.0, segs[0][1] + 0.05)
+                # 2) First pause
+                if insert_point is None and re.search(r"first\s+pause|first\s+silence|at\s+the\s+first\s+pause", text_for_time, re.IGNORECASE):
+                    pause = _find_first_pause(video_path)
+                    if pause:
+                        insert_point = max(0.0, pause[0])
+                # 3) Explicit "at <time>"
+                if insert_point is None:
+                    m = re.search(r"\bat\s+([0-9:.]+|\d+(?:\.\d+)?s)\b", text_for_time, re.IGNORECASE)
+                    if m:
+                        insert_point = _parse_time_token(m.group(1))
+                # 4) Range midpoint
+                if insert_point is None:
+                    rng = _parse_location_range(trans_location, dur) or _parse_location_range(prompt, dur)
+                    if rng is not None:
+                        s, e = rng
+                        insert_point = max(0.0, (s + e) / 2.0)
+                # 5) Fallback heuristic
+                if insert_point is None and dur is not None:
+                    insert_point = float(dur) * 0.25
+                if insert_point is None:
+                    insert_point = 0.0
+                print(f"🔁 Inserting transition at {insert_point:.3f}s")
+
+                result = ffmpeg_utils.insert_transition(
+                    str(video_path),
+                    str(output_path),
+                    insert_time=insert_point,
+                    transition_path=None,
+                    transition_duration_seconds=0.7
+                )
+                if result and result.get("success") and output_path.exists():
+                    return {
+                        "type": "specific",
+                        "commands": commands_text,
+                        "status": "completed",
+                        "output_file": output_filename,
+                        "output_path": str(output_path),
+                        "output_url": f"/api/outputs/{output_filename}",
+                        "success": True
+                    }
+                else:
+                    print(f"❌ Transition insert failed: {result}")
+            except Exception as e:
+                print(f"❌ Error during transition handling: {e}")
+
         # Direct blur handling to ensure we use ObjectProcessor for face blurring
         blur_cmd_idx = None
         blur_location = ""
