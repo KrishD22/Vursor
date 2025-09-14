@@ -1917,6 +1917,107 @@ async def process_specific_request(prompt: str, video_path: str) -> Dict[str, An
         
         print(f"📝 Parsed instances: {instances}")
         
+        # Direct blur handling to ensure we use ObjectProcessor for face blurring
+        blur_cmd_idx = None
+        blur_location = ""
+        for idx, (cmd, loc) in enumerate(instances):
+            if any(t in cmd.lower() for t in ["blur", "face blur", "blur faces", "apply blur"]):
+                blur_cmd_idx = idx
+                blur_location = loc or ""
+                break
+        if blur_cmd_idx is not None or "blur" in prompt_lower:
+            try:
+                try:
+                    from .object import ObjectProcessor
+                except ImportError:
+                    from object import ObjectProcessor
+                # Log source of ObjectProcessor
+                try:
+                    import inspect
+                    print(f"🧩 Using ObjectProcessor from: {inspect.getsourcefile(ObjectProcessor)}")
+                except Exception:
+                    pass
+
+                # Always treat blur as face blurring unless otherwise specified
+                detection_type = "faces"
+
+                # Output filename
+                timestamp = int(time.time())
+                video_path_obj = Path(video_path)
+                video_id = video_path_obj.stem
+                output_filename = f"ai_edited_{video_id[:8]}_{timestamp}.mp4"
+                output_path = OUTPUT_DIR / output_filename
+
+                # Instantiate processor
+                processor = ObjectProcessor(
+                    input_video_path=str(video_path),
+                    detection_type=detection_type,
+                    verbose=True
+                )
+                # Attempt to gate to a parsed time window if present
+                duration = _get_video_duration_seconds(video_path)
+                rng = _parse_location_range(blur_location, duration) or _parse_location_range(prompt, duration)
+                if rng and hasattr(processor, 'set_zoom_time_segments'):
+                    s, e = rng
+                    if e > s:
+                        print(f"⏱️ Applying blur in range: {s:.2f}s→{e:.2f}s")
+                        processor.set_zoom_time_segments([(s, e)])
+                # Enable strong face blur
+                processor.enable_object_blur(blur_strength=99)
+                if hasattr(processor, 'enable_debug_overlay'):
+                    processor.enable_debug_overlay(False)
+                try:
+                    print(f"🧠 Face backend: {getattr(processor, 'face_backend', 'unknown')}")
+                except Exception:
+                    pass
+
+                success = processor.process_and_save(str(output_path))
+                if success and output_path.exists():
+                    print(f"✅ ObjectProcessor blur completed. Output: {output_path}")
+                    # Convert to web-friendly MP4 if needed (H.264/AAC)
+                    try:
+                        info = ffmpeg_utils.get_media_info(str(output_path))
+                        vcodec = None
+                        acodec = None
+                        if info.get('success'):
+                            for s in info.get('info', {}).get('streams', []) or []:
+                                if s.get('codec_type') == 'video':
+                                    vcodec = s.get('codec_name')
+                                if s.get('codec_type') == 'audio':
+                                    acodec = s.get('codec_name')
+                        needs_convert = False
+                        if vcodec is None or vcodec.lower() not in { 'h264', 'avc1' }:
+                            needs_convert = True
+                        if acodec is None or acodec.lower() not in { 'aac', 'mp4a' }:
+                            needs_convert = True
+                        if needs_convert:
+                            conv_name = f"web_{output_filename}"
+                            conv_path = OUTPUT_DIR / conv_name
+                            print(f"🔄 Converting blur output to web-friendly MP4: {conv_path}")
+                            conv_res = ffmpeg_utils.convert_video(str(output_path), str(conv_path), video_codec="libx264", audio_codec="aac", quality="23")
+                            output_filename_converted = conv_name if (conv_res.get('success') and conv_path.exists()) else output_filename
+                        else:
+                            output_filename_converted = output_filename
+                    except Exception as _conv_err:
+                        print(f"⚠️ Convert check failed: {_conv_err}")
+                        output_filename_converted = output_filename
+
+                    final_name = output_filename_converted
+                    final_url = f"/api/outputs/{final_name}"
+                    return {
+                        "type": "specific",
+                        "commands": commands_text,
+                        "status": "completed",
+                        "output_file": final_name,
+                        "output_path": str(OUTPUT_DIR / final_name),
+                        "output_url": final_url,
+                        "success": True
+                    }
+                else:
+                    print("❌ ObjectProcessor blur failed or output missing")
+            except Exception as e:
+                print(f"❌ Error during direct blur handling: {e}")
+
         # Direct zoom handling to ensure we use ObjectProcessor (faces/objects)
         zoom_cmd_idx = None
         zoom_location = ""
